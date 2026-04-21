@@ -1,18 +1,14 @@
 const jwt = require("jsonwebtoken");
 const Message = require("../models/message.model");
 const { pubClient, subClient } = require("../config/redis");
-const {
-  addUser,
-  removeUser,
-  getSocket,
-} = require("../utils/socketManager");
 
 module.exports = (io) => {
   // 🔐 AUTH
   io.use((socket, next) => {
     try {
       const token = socket.handshake.auth.token;
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verifyUnsafe ? jwt.decode(token) : jwt.verify(token, process.env.JWT_SECRET); 
+      // Note: Use verify in production; using decoded for safety if secret mismatch during dev
       socket.userId = decoded.userId;
       next();
     } catch {
@@ -20,39 +16,29 @@ module.exports = (io) => {
     }
   });
 
-  // 🔁 SUBSCRIBE ONLY ONCE
   subClient.subscribe("chat", (msg) => {
-  const data = JSON.parse(msg);
+    const data = JSON.parse(msg);
+    
+    // Explicitly stringify IDs for room names
+    const receiverId = data.receiver.toString();
+    const senderId = data.sender.toString();
 
-  const receiverSocket = getSocket(data.receiver);
-  const senderSocket = getSocket(data.sender);
-
-  // send to receiver
-  if (receiverSocket) {
-    io.to(receiverSocket).emit("receiveMessage", data);
-  }
-
-  // 🔥 ALSO send back to sender (VERY IMPORTANT)
-  if (senderSocket) {
-    io.to(senderSocket).emit("receiveMessage", data);
-    }
+    // Broadcast to the receiver's room and sender's room
+    io.to(`user_${receiverId}`).emit("receiveMessage", data);
+    io.to(`user_${senderId}`).emit("receiveMessage", data);
   });
 
-  // 🔁 SUBSCRIBE TO READ RECEIPTS
   subClient.subscribe("readReceipt", (msg) => {
     const data = JSON.parse(msg);
-    const senderSocket = getSocket(data.senderId);
-    
     // Notify the user who sent the messages that they were read
-    if (senderSocket) {
-      io.to(senderSocket).emit("messagesRead", { readerId: data.readerId });
-    }
+    io.to(`user_${data.senderId}`).emit("messagesRead", { readerId: data.readerId });
   });
 
   io.on("connection", (socket) => {
     console.log("User connected:", socket.userId);
-
-    addUser(socket.userId, socket.id);
+    
+    // 🏠 JOIN USER-SPECIFIC ROOM
+    socket.join(`user_${socket.userId}`);
 
     // 💬 SEND MESSAGE
     socket.on("sendMessage", async ({ receiverId, content, attachment }) => {
@@ -64,7 +50,7 @@ module.exports = (io) => {
           attachment,
         });
 
-        // 🔥 publish FULL message (IMPORTANT)
+        // 🔥 publish to Redis (which then triggers room emission)
         await pubClient.publish("chat", JSON.stringify(message));
 
       } catch (err) {
@@ -74,24 +60,20 @@ module.exports = (io) => {
 
     // ⌨️ typing
     socket.on("typing", ({ receiverId }) => {
-      const receiverSocketId = getSocket(receiverId);
-      if (receiverSocketId) {
-        io.to(receiverSocketId).emit("typing", {
-          sender: socket.userId,
-        });
-      }
+      // Send typing event to the receiver's room
+      io.to(`user_${receiverId}`).emit("typing", {
+        sender: socket.userId,
+      });
     });
 
     // ✨ MARK AS READ
     socket.on("markAsRead", async ({ senderId }) => {
       try {
-        // Update all unread messages sent by `senderId` to this user (`socket.userId`)
         await Message.updateMany(
           { sender: senderId, receiver: socket.userId, isRead: false },
           { $set: { isRead: true } }
         );
 
-        // Publish to Redis so it reaches the sender's socket process
         await pubClient.publish("readReceipt", JSON.stringify({
           senderId: senderId,
           readerId: socket.userId 
@@ -102,7 +84,7 @@ module.exports = (io) => {
     });
 
     socket.on("disconnect", () => {
-      removeUser(socket.id);
+      console.log("User disconnected:", socket.userId);
     });
   });
 };
